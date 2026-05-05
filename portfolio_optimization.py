@@ -43,7 +43,12 @@ WINDOW          = 5
 INITIAL_CAPITAL = 10_000.0
 MA_SHORT        = 5
 MA_LONG         = 20
-VIX_THRESHOLD   = 25
+
+# ── CNN Fear & Greed threshold ──
+# Score 0–25  → Extreme Fear → Hold Cash
+# Score 26–100 → Normal     → Run MPT
+CNN_FEAR_THRESHOLD = 25
+
 OUTPUT_DIR      = "outputs/"
 
 
@@ -97,20 +102,90 @@ def download_spy():
     return close
 
 
-def download_vix():
-    print("  Downloading VIX (Fear Index)...")
-    df = yf.download("^VIX", start=START_DATE, end=END_DATE,
-                     auto_adjust=True, progress=False, threads=False)
-    if df is None or df.empty:
-        raise ValueError("VIX download failed.")
-    close = df["Close"]
+def download_cnn_fear_greed():
+    """
+    Download CNN Fear & Greed Index historical data.
+    Uses the fear-greed package which pulls from CNN's internal API.
+
+    CNN Fear & Greed Index (0-100):
+      0  – 25  → Extreme Fear  → Portfolio holds cash
+      26 – 45  → Fear
+      46 – 55  → Neutral
+      56 – 75  → Greed
+      76 – 100 → Extreme Greed
+
+    Based on 7 market indicators:
+      1. Market Momentum (S&P 500 vs 125-day MA)
+      2. Stock Price Strength (52-week highs vs lows)
+      3. Stock Price Breadth (McClellan Volume Summation)
+      4. Put/Call Options ratio
+      5. Market Volatility (VIX vs 50-day MA)
+      6. Junk Bond Demand (yield spread)
+      7. Safe Haven Demand (stocks vs bonds)
+    """
+    print("  Downloading CNN Fear & Greed Index...")
+    try:
+        import fear_greed
+        history = fear_greed.get_history(last="365")
+
+        records = []
+        for point in history:
+            records.append({
+                "date":   pd.to_datetime(point.date).tz_localize(None).normalize(),
+                "score":  point.score,
+                "rating": point.rating
+            })
+
+        df = pd.DataFrame(records).set_index("date").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+
+        current_score  = fear_greed.get_score()
+        current_rating = fear_greed.get_rating()
+
+        print(f"  CNN F&G Score: {current_score:.1f} ({current_rating})")
+        print(f"  Score range (1yr): {df['score'].min():.1f} – {df['score'].max():.1f}")
+        return df, current_score, current_rating
+
+    except Exception as e:
+        print(f"  CNN Fear & Greed failed: {e}")
+        print("  Falling back to VIX as fear proxy...")
+        return _fallback_vix()
+
+
+def _fallback_vix():
+    """
+    Fallback to VIX if CNN API is unavailable.
+    Converts VIX to a 0-100 fear score (inverted — high VIX = low score = more fear).
+    VIX 10 → score ~90 (extreme greed)
+    VIX 25 → score ~50 (neutral)
+    VIX 45 → score ~10 (extreme fear)
+    """
+    print("  Using VIX fallback...")
+    df_vix = yf.download("^VIX", start=START_DATE, end=END_DATE,
+                         auto_adjust=True, progress=False, threads=False)
+    close = df_vix["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     close = close.dropna()
     close.index = pd.to_datetime(close.index).normalize()
-    close.name = "VIX"
-    print(f"  VIX range: {close.min():.1f} – {close.max():.1f}")
-    return close
+
+    # Convert VIX to 0-100 fear score (inverted)
+    score = 100 - ((close - 10) / (80 - 10) * 100).clip(0, 100)
+
+    df = pd.DataFrame({
+        "score":  score.values,
+        "rating": score.apply(lambda s:
+            "extreme fear" if s <= 25 else
+            "fear"         if s <= 45 else
+            "neutral"      if s <= 55 else
+            "greed"        if s <= 75 else
+            "extreme greed"
+        )
+    }, index=close.index)
+
+    current_score  = float(df["score"].iloc[-1])
+    current_rating = df["rating"].iloc[-1]
+    return df, current_score, current_rating
 
 
 def compute_returns(prices):
@@ -179,32 +254,30 @@ def optimize_portfolio(returns_subset):
 
 # ─────────────────────────────────────────────
 # Today's Allocation
-# Uses the last WINDOW days to compute today's
-# recommended weights — this is the live signal
+# Last WINDOW days → optimize → live signal
 # ─────────────────────────────────────────────
 
-def compute_todays_allocation(prices, vix_series):
+def compute_todays_allocation(prices, fg_df, current_score, current_rating):
     returns    = compute_returns(prices)
     last_5     = returns.iloc[-WINDOW:]
     today_date = datetime.today().strftime("%Y-%m-%d")
 
-    # Check VIX fear gate
-    latest_vix = vix_series.iloc[-1]
-    in_market  = latest_vix <= VIX_THRESHOLD
+    in_market = current_score > CNN_FEAR_THRESHOLD
 
-    print(f"\nToday's Date:  {today_date}")
-    print(f"Latest VIX:    {latest_vix:.2f} "
-          f"({'NORMAL — Investing' if in_market else 'EXTREME FEAR — Holding Cash'})")
+    print(f"\nToday's Date:      {today_date}")
+    print(f"CNN F&G Score:     {current_score:.1f} ({current_rating.title()})")
+    print(f"Market Signal:     {'NORMAL — Investing' if in_market else 'EXTREME FEAR — Holding Cash'}")
 
     if not in_market:
-        print("VIX above threshold. Today's recommendation: HOLD CASH")
+        print("CNN Fear Gate: HOLD CASH")
         allocation = pd.DataFrame([{
             "date":       today_date,
             "ticker":     "CASH",
             "sector":     "N/A",
             "weight":     1.0,
-            "vix":        round(latest_vix, 2),
-            "signal":     "HOLD CASH — VIX > 25"
+            "cnn_score":  round(current_score, 2),
+            "cnn_rating": current_rating,
+            "signal":     "HOLD CASH — Extreme Fear"
         }])
         return allocation
 
@@ -226,7 +299,8 @@ def compute_todays_allocation(prices, vix_series):
             "ticker":     ticker,
             "sector":     SECTOR_MAP.get(ticker, "N/A"),
             "weight":     round(w, 4),
-            "vix":        round(latest_vix, 2),
+            "cnn_score":  round(current_score, 2),
+            "cnn_rating": current_rating,
             "signal":     "INVEST"
         })
 
@@ -235,8 +309,7 @@ def compute_todays_allocation(prices, vix_series):
         print(f"Expected Ann. Vol:     {ann_vol*100:.2f}%")
         print(f"Expected Sharpe:       {sharpe:.4f}")
 
-    allocation = pd.DataFrame(rows)
-    return allocation
+    return pd.DataFrame(rows)
 
 
 # ─────────────────────────────────────────────
@@ -288,6 +361,8 @@ def run_mpt_backtest(prices):
 
 # ─────────────────────────────────────────────
 # Strategy 2 — Moving Average Crossover
+# 5-day MA > 20-day MA → invested in SPY
+# 5-day MA < 20-day MA → hold cash
 # ─────────────────────────────────────────────
 
 def run_ma_strategy(spy_series):
@@ -312,11 +387,14 @@ def run_ma_strategy(spy_series):
 
 
 # ─────────────────────────────────────────────
-# Strategy 3 — VIX Fear Gated MPT
+# Strategy 3 — CNN Fear & Greed Gated MPT
+#
+# Runs MPT normally when CNN score > 25
+# Holds cash when CNN score <= 25 (Extreme Fear)
 # ─────────────────────────────────────────────
 
-def run_vix_strategy(prices, vix_series):
-    print("Running VIX Fear Index gated MPT strategy...")
+def run_cnn_strategy(prices, fg_df):
+    print("Running CNN Fear & Greed gated MPT strategy...")
     returns   = compute_returns(prices)
     all_dates = returns.index
 
@@ -330,10 +408,17 @@ def run_vix_strategy(prices, vix_series):
         today_date = all_dates[i]
         today_ret  = returns.iloc[i]
 
-        prev_date    = all_dates[i - 1]
-        vix_yesterday = vix_series.loc[prev_date] if prev_date in vix_series.index else 20.0
+        # Use previous day's CNN score to avoid lookahead bias
+        prev_date = all_dates[i - 1]
+        if prev_date in fg_df.index:
+            prev_score = fg_df.loc[prev_date, "score"]
+        else:
+            # Find nearest available date
+            available = fg_df.index[fg_df.index <= prev_date]
+            prev_score = fg_df.loc[available[-1], "score"] if len(available) > 0 else 50.0
 
-        if vix_yesterday > VIX_THRESHOLD:
+        # Fear gate
+        if prev_score <= CNN_FEAR_THRESHOLD:
             days_in_cash += 1
             portfolio_values.append((today_date, portfolio_val))
             continue
@@ -354,11 +439,11 @@ def run_vix_strategy(prices, vix_series):
 
     total_days = days_in_cash + days_invested
     pct_cash   = days_in_cash / total_days * 100 if total_days > 0 else 0
-    print(f"  VIX strategy: {days_invested} days invested, "
+    print(f"  CNN strategy: {days_invested} days invested, "
           f"{days_in_cash} days in cash ({pct_cash:.1f}% cash rate)")
 
-    vix_df = pd.DataFrame(portfolio_values, columns=["Date", "Value"]).set_index("Date")
-    return vix_df
+    cnn_df = pd.DataFrame(portfolio_values, columns=["Date", "Value"]).set_index("Date")
+    return cnn_df
 
 
 # ─────────────────────────────────────────────
@@ -393,21 +478,21 @@ def build_spy_baseline(spy_series, port_index):
 # Align all strategies to common dates
 # ─────────────────────────────────────────────
 
-def align_strategies(port_df, spy_df, ma_df, vix_df):
+def align_strategies(port_df, spy_df, ma_df, cnn_df):
     common = (port_df.index
               .intersection(spy_df.index)
               .intersection(ma_df.index)
-              .intersection(vix_df.index))
+              .intersection(cnn_df.index))
 
     port_df = port_df.loc[common].copy()
     spy_df  = spy_df.loc[common].copy()
     ma_df   = ma_df.loc[common].copy()
-    vix_df  = vix_df.loc[common].copy()
+    cnn_df  = cnn_df.loc[common].copy()
 
-    for df in [spy_df, ma_df, vix_df]:
+    for df in [spy_df, ma_df, cnn_df]:
         df["Value"] = df["Value"] / df["Value"].iloc[0] * INITIAL_CAPITAL
 
-    return port_df, spy_df, ma_df, vix_df
+    return port_df, spy_df, ma_df, cnn_df
 
 
 # ─────────────────────────────────────────────
@@ -467,7 +552,7 @@ def plot_efficient_frontier(returns, selected_stocks, optimal_weights):
 # Plot 2 — Portfolio Value: All 4 Strategies
 # ─────────────────────────────────────────────
 
-def plot_performance(port_df, spy_df, ma_df, vix_df):
+def plot_performance(port_df, spy_df, ma_df, cnn_df):
     print("Plotting performance comparison...")
     fig, ax = plt.subplots(figsize=(13, 5))
     ax.plot(port_df.index, port_df["Value"], label="MPT Portfolio",
@@ -476,7 +561,7 @@ def plot_performance(port_df, spy_df, ma_df, vix_df):
             color="darkorange", linewidth=2, linestyle="--")
     ax.plot(ma_df.index,   ma_df["Value"],   label="MA Crossover (5/20)",
             color="green",      linewidth=2, linestyle="-.")
-    ax.plot(vix_df.index,  vix_df["Value"],  label="VIX Fear Gated MPT",
+    ax.plot(cnn_df.index,  cnn_df["Value"],  label="CNN Fear Gated MPT",
             color="crimson",    linewidth=2, linestyle=":")
     ax.set_xlabel("Date",                fontsize=11)
     ax.set_ylabel("Portfolio Value ($)", fontsize=11)
@@ -529,7 +614,7 @@ def plot_allocation_shift(rebalance_records):
 # Plot 4 — Rolling 21-Day Sharpe Ratio
 # ─────────────────────────────────────────────
 
-def plot_rolling_sharpe(port_df, spy_df, ma_df, vix_df):
+def plot_rolling_sharpe(port_df, spy_df, ma_df, cnn_df):
     print("Plotting rolling Sharpe...")
     roll = 21
 
@@ -548,9 +633,9 @@ def plot_rolling_sharpe(port_df, spy_df, ma_df, vix_df):
     ax.plot(rolling_sharpe(ma_df["Value"]).index,
             rolling_sharpe(ma_df["Value"]),
             label="MA Crossover (5/20)",  color="green",      linewidth=1.5, linestyle="-.")
-    ax.plot(rolling_sharpe(vix_df["Value"]).index,
-            rolling_sharpe(vix_df["Value"]),
-            label="VIX Fear Gated MPT",   color="crimson",    linewidth=1.5, linestyle=":")
+    ax.plot(rolling_sharpe(cnn_df["Value"]).index,
+            rolling_sharpe(cnn_df["Value"]),
+            label="CNN Fear Gated MPT",   color="crimson",    linewidth=1.5, linestyle=":")
     ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
     ax.set_xlabel("Date",                       fontsize=11)
     ax.set_ylabel(f"Rolling {roll}-Day Sharpe", fontsize=11)
@@ -566,30 +651,43 @@ def plot_rolling_sharpe(port_df, spy_df, ma_df, vix_df):
 
 
 # ─────────────────────────────────────────────
-# Plot 5 — VIX Fear Index
+# Plot 5 — CNN Fear & Greed Index Over Time
 # ─────────────────────────────────────────────
 
-def plot_vix(vix_series):
-    print("Plotting VIX fear index...")
+def plot_cnn_fear_greed(fg_df):
+    print("Plotting CNN Fear & Greed Index...")
+
+    scores = fg_df["score"]
+
     fig, ax = plt.subplots(figsize=(13, 4))
-    ax.plot(vix_series.index, vix_series.values,
-            color="crimson", linewidth=1.5, label="VIX")
-    ax.axhline(VIX_THRESHOLD, color="black", linewidth=1,
-               linestyle="--", label=f"Fear Threshold ({VIX_THRESHOLD})")
-    ax.fill_between(vix_series.index, VIX_THRESHOLD, vix_series.values,
-                    where=(vix_series.values > VIX_THRESHOLD),
-                    alpha=0.2, color="crimson", label="Extreme Fear (Cash)")
-    ax.fill_between(vix_series.index, 0, vix_series.values,
-                    where=(vix_series.values <= VIX_THRESHOLD),
-                    alpha=0.1, color="green", label="Normal (Invested)")
-    ax.set_xlabel("Date",      fontsize=11)
-    ax.set_ylabel("VIX Level", fontsize=11)
-    ax.set_title("VIX Fear Index — Red Zones = Portfolio Holds Cash", fontsize=13)
-    ax.legend(fontsize=10)
+
+    # Color zones
+    ax.axhspan(0,  25,  alpha=0.08, color="red",    label="Extreme Fear (0–25)")
+    ax.axhspan(25, 45,  alpha=0.06, color="orange",  label="Fear (25–45)")
+    ax.axhspan(45, 55,  alpha=0.05, color="yellow",  label="Neutral (45–55)")
+    ax.axhspan(55, 75,  alpha=0.06, color="lightgreen", label="Greed (55–75)")
+    ax.axhspan(75, 100, alpha=0.08, color="green",   label="Extreme Greed (75–100)")
+
+    ax.plot(scores.index, scores.values,
+            color="black", linewidth=1.5, label="CNN F&G Score", zorder=5)
+
+    ax.axhline(CNN_FEAR_THRESHOLD, color="red", linewidth=1.2,
+               linestyle="--", label=f"Cash Threshold ({CNN_FEAR_THRESHOLD})")
+
+    # Shade cash zones
+    ax.fill_between(scores.index, 0, scores.values,
+                    where=(scores.values <= CNN_FEAR_THRESHOLD),
+                    alpha=0.25, color="red", label="Portfolio Holds Cash")
+
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("Date",                    fontsize=11)
+    ax.set_ylabel("Fear & Greed Score",      fontsize=11)
+    ax.set_title("CNN Fear & Greed Index — Red Zones = Portfolio Holds Cash", fontsize=13)
+    ax.legend(loc="upper right", fontsize=8, ncol=2)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     fig.autofmt_xdate()
     plt.tight_layout()
-    path = OUTPUT_DIR + "vix_fear_index.png"
+    path = OUTPUT_DIR + "cnn_fear_greed.png"
     plt.savefig(path, dpi=150)
     plt.close()
     print(f"  Saved: {path}")
@@ -599,18 +697,19 @@ def plot_vix(vix_series):
 # Print + Save Summary
 # ─────────────────────────────────────────────
 
-def print_and_save_summary(port_df, spy_df, ma_df, vix_df, rebalance_records, elapsed):
+def print_and_save_summary(port_df, spy_df, ma_df, cnn_df,
+                            rebalance_records, elapsed):
     metrics = [
         compute_metrics(port_df["Value"], "MPT Portfolio"),
         compute_metrics(spy_df["Value"],  "S&P 500 Buy & Hold"),
         compute_metrics(ma_df["Value"],   "MA Crossover (5/20)"),
-        compute_metrics(vix_df["Value"],  "VIX Fear Gated MPT"),
+        compute_metrics(cnn_df["Value"],  "CNN Fear Gated MPT"),
     ]
 
     print("\n" + "=" * 74)
     print("PERFORMANCE SUMMARY")
     print("=" * 74)
-    print(f"{'Metric':<26} {'MPT':>11} {'S&P 500':>11} {'MA Cross':>11} {'VIX MPT':>11}")
+    print(f"{'Metric':<26} {'MPT':>11} {'S&P 500':>11} {'MA Cross':>11} {'CNN MPT':>11}")
     print("-" * 74)
     for key in ["Final Value ($)", "Total Return (%)", "Annualized Sharpe", "Max Drawdown (%)"]:
         vals = [str(m[key]) for m in metrics]
@@ -633,15 +732,16 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # --- Data ---
-    prices = download_prices()
-    spy    = download_spy()
-    vix    = download_vix()
+    prices             = download_prices()
+    spy                = download_spy()
+    fg_df, cur_score, cur_rating = download_cnn_fear_greed()
 
-    # --- Today's live allocation (production signal) ---
+    # --- Today's live allocation ---
     print("\n" + "=" * 50)
     print("TODAY'S RECOMMENDED ALLOCATION")
     print("=" * 50)
-    todays_allocation = compute_todays_allocation(prices, vix)
+    todays_allocation = compute_todays_allocation(
+        prices, fg_df, cur_score, cur_rating)
     todays_allocation.to_csv(OUTPUT_DIR + "todays_allocation.csv", index=False)
     print(f"Saved: {OUTPUT_DIR}todays_allocation.csv")
 
@@ -662,16 +762,17 @@ def main():
     port_df, rebalance_records = run_mpt_backtest(prices)
     spy_df                     = build_spy_baseline(spy, port_df.index)
     ma_df                      = run_ma_strategy(spy)
-    vix_df                     = run_vix_strategy(prices, vix)
+    cnn_df                     = run_cnn_strategy(prices, fg_df)
 
     # --- Align to common dates ---
-    port_df, spy_df, ma_df, vix_df = align_strategies(port_df, spy_df, ma_df, vix_df)
+    port_df, spy_df, ma_df, cnn_df = align_strategies(
+        port_df, spy_df, ma_df, cnn_df)
 
     # --- Generate all 5 plots ---
-    plot_performance(port_df, spy_df, ma_df, vix_df)
+    plot_performance(port_df, spy_df, ma_df, cnn_df)
     plot_allocation_shift(rebalance_records)
-    plot_rolling_sharpe(port_df, spy_df, ma_df, vix_df)
-    plot_vix(vix)
+    plot_rolling_sharpe(port_df, spy_df, ma_df, cnn_df)
+    plot_cnn_fear_greed(fg_df)
 
     # --- Save portfolio values ---
     port_df.to_csv(OUTPUT_DIR + "portfolio_values.csv")
@@ -679,7 +780,8 @@ def main():
 
     # --- Final summary ---
     elapsed = time.time() - START_TIME
-    print_and_save_summary(port_df, spy_df, ma_df, vix_df, rebalance_records, elapsed)
+    print_and_save_summary(port_df, spy_df, ma_df, cnn_df,
+                           rebalance_records, elapsed)
 
 
 if __name__ == "__main__":
