@@ -54,7 +54,6 @@
       font-weight: 600;
     }
 
-    /* ── Summary Cards ── */
     .cards {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -91,7 +90,6 @@
       margin-top: 4px;
     }
 
-    /* ── Sections ── */
     .section {
       max-width: 1100px;
       margin: 0 auto 40px;
@@ -106,7 +104,6 @@
       border-bottom: 1px solid #30363d;
     }
 
-    /* ── Tables ── */
     table {
       width: 100%;
       border-collapse: collapse;
@@ -138,9 +135,7 @@
     .positive { color: #3fb950; font-weight: 600; }
     .negative { color: #f85149; font-weight: 600; }
     .neutral  { color: #58a6ff; font-weight: 600; }
-    .cash     { color: #f0883e; font-weight: 600; }
 
-    /* ── Today's Allocation ── */
     .alloc-box {
       background: #161b22;
       border: 1px solid #30363d;
@@ -168,7 +163,6 @@
     .signal-invest { color: #3fb950; font-weight: 700; }
     .signal-cash   { color: #f85149; font-weight: 700; }
 
-    /* ── Charts ── */
     .charts {
       max-width: 1100px;
       margin: 0 auto;
@@ -196,7 +190,6 @@
       display: block;
     }
 
-    /* ── Footer ── */
     footer {
       text-align: center;
       margin-top: 48px;
@@ -330,25 +323,26 @@
   </footer>
 
   <script>
-    // ── Cache-bust images so browser always loads latest ──
     const ts = new Date().getTime();
+
+    // Cache-bust all chart images
     document.querySelectorAll(".chart-card img").forEach(img => {
       img.src = img.src.replace("cb=1", "cb=" + ts);
     });
 
-    // ── Show last updated timestamp ──
+    // Last updated timestamp
     const now = new Date();
     document.getElementById("last-updated").textContent =
       "Updated: " + now.toLocaleDateString("en-US", {
         month: "short", day: "numeric", year: "numeric"
       });
 
-    // ── Load summary.csv and populate table + cards ──
+    // Load summary.csv
     fetch("outputs/summary.csv?cb=" + ts)
       .then(r => r.text())
       .then(text => {
-        const lines  = text.trim().split("\n");
-        const tbody  = document.getElementById("summary-body");
+        const lines = text.trim().split("\n");
+        const tbody = document.getElementById("summary-body");
         tbody.innerHTML = "";
 
         const colorMap = {
@@ -359,8 +353,8 @@
         };
 
         for (let i = 1; i < lines.length; i++) {
-          const cols    = lines[i].split(",");
-          const strategy = cols[0];
+          const cols     = lines[i].trim().split(",");
+          const strategy = cols[0].trim();
           const final    = parseFloat(cols[1]);
           const ret      = parseFloat(cols[2]);
           const sharpe   = parseFloat(cols[3]);
@@ -377,7 +371,6 @@
           `;
           tbody.appendChild(tr);
 
-          // Populate MPT cards from first row
           if (i === 1) {
             document.getElementById("card-final").textContent =
               "$" + final.toLocaleString("en-US", {minimumFractionDigits:0, maximumFractionDigits:0});
@@ -393,7 +386,7 @@
           "<tr><td colspan='5' style='color:#f85149'>Failed to load summary.csv</td></tr>";
       });
 
-    // ── Load todays_allocation.csv and populate allocation table ──
+    // Load todays_allocation.csv
     fetch("outputs/todays_allocation.csv?cb=" + ts)
       .then(r => r.text())
       .then(text => {
@@ -401,18 +394,17 @@
         const tbody = document.getElementById("alloc-body");
         tbody.innerHTML = "";
 
-        // Parse header: date,ticker,sector,weight,vix,signal
         let allocDate = "";
         let vixVal    = "";
 
         for (let i = 1; i < lines.length; i++) {
-          const cols   = lines[i].split(",");
-          allocDate    = cols[0];
-          const ticker = cols[1];
-          const sector = cols[2];
+          const cols   = lines[i].trim().split(",");
+          allocDate    = cols[0].trim();
+          const ticker = cols[1].trim();
+          const sector = cols[2].trim();
           const weight = parseFloat(cols[3]) * 100;
-          vixVal       = cols[4];
-          const signal = cols[5];
+          vixVal       = cols[4].trim();
+          const signal = cols[5] ? cols[5].trim() : "";   // ← trim fix
 
           const isCash      = ticker === "CASH";
           const signalClass = isCash ? "signal-cash" : "signal-invest";
@@ -432,15 +424,14 @@
         document.getElementById("card-vix").textContent =
           "VIX: " + vixVal;
 
-        // Set signal card
-        const signalEl   = document.getElementById("card-signal");
-        const firstSignal = lines[1] ? lines[1].split(",")[5] : "";
-        if (firstSignal.includes("CASH")) {
-          signalEl.textContent  = "HOLD CASH";
-          signalEl.className    = "value signal-cash";
+        const signalEl    = document.getElementById("card-signal");
+        const firstSignal = lines[1] ? lines[1].trim().split(",")[5] : "";
+        if (firstSignal && firstSignal.trim().includes("CASH")) {
+          signalEl.textContent = "HOLD CASH";
+          signalEl.className   = "value signal-cash";
         } else {
-          signalEl.textContent  = "INVEST";
-          signalEl.className    = "value signal-invest";
+          signalEl.textContent = "INVEST";
+          signalEl.className   = "value signal-invest";
         }
       })
       .catch(() => {
