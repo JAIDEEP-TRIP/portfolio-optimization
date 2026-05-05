@@ -583,25 +583,48 @@ def plot_performance(port_df, spy_df, ma_df, cnn_df):
 
 def plot_allocation_shift(rebalance_records):
     print("Plotting allocation shift...")
-    dates         = [r["date"] for r in rebalance_records]
-    weight_matrix = [{t: r["weights"].get(t, 0.0) for t in ALL_TICKERS}
-                     for r in rebalance_records]
-    df_w   = pd.DataFrame(weight_matrix, index=dates)
-    colors = plt.cm.tab20.colors
 
-    fig, ax = plt.subplots(figsize=(13, 5))
-    bottom  = np.zeros(len(df_w))
-    for idx, col in enumerate(df_w.columns):
-        vals = df_w[col].values
-        ax.fill_between(df_w.index, bottom, bottom + vals,
-                        label=col, alpha=0.8, color=colors[idx % len(colors)])
+    # Sample every 5 days
+    sampled = rebalance_records[::5]
+    dates   = [r["date"] for r in sampled]
+
+    # Group weights by sector
+    sector_weights = []
+    for r in sampled:
+        row = {s: 0.0 for s in TICKERS.keys()}
+        for ticker, w in r["weights"].items():
+            sector = SECTOR_MAP.get(ticker, None)
+            if sector:
+                row[sector] += w
+        sector_weights.append(row)
+
+    df_s = pd.DataFrame(sector_weights, index=dates)
+
+    sector_colors = {
+        "Tech":        "#58a6ff",
+        "Healthcare":  "#3fb950",
+        "Utilities":   "#e3b341",
+        "Commodities": "#f0883e",
+        "Finance":     "#bc8cff"
+    }
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    bottom  = np.zeros(len(df_s))
+
+    for sector in TICKERS.keys():
+        vals = df_s[sector].values
+        ax.bar(df_s.index, vals, bottom=bottom,
+               label=sector, color=sector_colors[sector],
+               width=3, alpha=0.88)
         bottom += vals
 
     ax.set_xlabel("Date",   fontsize=11)
     ax.set_ylabel("Weight", fontsize=11)
-    ax.set_title("Daily Allocation Shift Across Stocks (MPT)", fontsize=13)
-    ax.legend(loc="upper right", fontsize=7, ncol=4)
+    ax.set_title("Sector Allocation Shift Over Time (MPT)", fontsize=13)
+    ax.legend(loc="upper right", fontsize=10, ncol=1)
+    ax.set_ylim(0, 1.05)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
     fig.autofmt_xdate()
     plt.tight_layout()
     path = OUTPUT_DIR + "allocation_shift.png"
