@@ -1,5 +1,6 @@
 import time
 import warnings
+from datetime import datetime, timedelta
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -13,9 +14,9 @@ warnings.filterwarnings("ignore")
 
 START_TIME = time.time()
 
-
+# ─────────────────────────────────────────────
 # Configuration
-
+# ─────────────────────────────────────────────
 
 TICKERS = {
     "Tech":        ["AAPL", "MSFT", "GOOGL", "NVDA"],
@@ -28,8 +29,12 @@ TICKERS = {
 ALL_TICKERS     = [t for s in TICKERS.values() for t in s]
 SECTOR_MAP      = {t: s for s, ticks in TICKERS.items() for t in ticks}
 
-START_DATE      = "2023-01-01"
-END_DATE        = "2024-01-01"
+# ── Dynamic dates: always rolling 1 year up to today ──
+END_DATE        = datetime.today().strftime("%Y-%m-%d")
+START_DATE      = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+
+print(f"Date range: {START_DATE} → {END_DATE}")
+
 NUM_STOCKS      = 10
 MIN_WEIGHT      = 0.05
 MAX_WEIGHT      = 0.30
@@ -38,12 +43,13 @@ WINDOW          = 5
 INITIAL_CAPITAL = 10_000.0
 MA_SHORT        = 5
 MA_LONG         = 20
+VIX_THRESHOLD   = 25
 OUTPUT_DIR      = "outputs/"
 
 
-
+# ─────────────────────────────────────────────
 # Data Download
-
+# ─────────────────────────────────────────────
 
 def download_prices():
     import time as t
@@ -91,13 +97,29 @@ def download_spy():
     return close
 
 
+def download_vix():
+    print("  Downloading VIX (Fear Index)...")
+    df = yf.download("^VIX", start=START_DATE, end=END_DATE,
+                     auto_adjust=True, progress=False, threads=False)
+    if df is None or df.empty:
+        raise ValueError("VIX download failed.")
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close = close.dropna()
+    close.index = pd.to_datetime(close.index).normalize()
+    close.name = "VIX"
+    print(f"  VIX range: {close.min():.1f} – {close.max():.1f}")
+    return close
+
+
 def compute_returns(prices):
     return prices.pct_change().dropna()
 
 
-
+# ─────────────────────────────────────────────
 # Portfolio Metrics
-
+# ─────────────────────────────────────────────
 
 def portfolio_performance(weights, mean_returns, cov_matrix):
     ret = np.dot(weights, mean_returns) * 252
@@ -106,9 +128,9 @@ def portfolio_performance(weights, mean_returns, cov_matrix):
     return ret, vol, sharpe
 
 
-
+# ─────────────────────────────────────────────
 # Stock Selection — Top 2 Sharpe per Sector
-
+# ─────────────────────────────────────────────
 
 def select_top_stocks(returns):
     selected = []
@@ -123,9 +145,9 @@ def select_top_stocks(returns):
     return selected[:NUM_STOCKS]
 
 
-
+# ─────────────────────────────────────────────
 # Optimization — Maximum Sharpe Ratio (SLSQP)
-
+# ─────────────────────────────────────────────
 
 def optimize_portfolio(returns_subset):
     n = len(returns_subset.columns)
@@ -155,11 +177,71 @@ def optimize_portfolio(returns_subset):
     return None, None, None, None
 
 
+# ─────────────────────────────────────────────
+# Today's Allocation
+# Uses the last WINDOW days to compute today's
+# recommended weights — this is the live signal
+# ─────────────────────────────────────────────
 
+def compute_todays_allocation(prices, vix_series):
+    returns    = compute_returns(prices)
+    last_5     = returns.iloc[-WINDOW:]
+    today_date = datetime.today().strftime("%Y-%m-%d")
+
+    # Check VIX fear gate
+    latest_vix = vix_series.iloc[-1]
+    in_market  = latest_vix <= VIX_THRESHOLD
+
+    print(f"\nToday's Date:  {today_date}")
+    print(f"Latest VIX:    {latest_vix:.2f} "
+          f"({'NORMAL — Investing' if in_market else 'EXTREME FEAR — Holding Cash'})")
+
+    if not in_market:
+        print("VIX above threshold. Today's recommendation: HOLD CASH")
+        allocation = pd.DataFrame([{
+            "date":       today_date,
+            "ticker":     "CASH",
+            "sector":     "N/A",
+            "weight":     1.0,
+            "vix":        round(latest_vix, 2),
+            "signal":     "HOLD CASH — VIX > 25"
+        }])
+        return allocation
+
+    selected = select_top_stocks(last_5)
+    weights, ann_ret, ann_vol, sharpe = optimize_portfolio(last_5[selected])
+
+    if weights is None:
+        weights = np.full(len(selected), 1.0 / len(selected))
+        ann_ret = ann_vol = sharpe = None
+        print("  Optimizer fell back to equal weights")
+
+    rows = []
+    print(f"\n{'Ticker':<8} {'Sector':<14} {'Weight':>8}")
+    print("-" * 32)
+    for ticker, w in zip(selected, weights):
+        print(f"{ticker:<8} {SECTOR_MAP.get(ticker, 'N/A'):<14} {w*100:>7.1f}%")
+        rows.append({
+            "date":       today_date,
+            "ticker":     ticker,
+            "sector":     SECTOR_MAP.get(ticker, "N/A"),
+            "weight":     round(w, 4),
+            "vix":        round(latest_vix, 2),
+            "signal":     "INVEST"
+        })
+
+    if sharpe:
+        print(f"\nExpected Ann. Return:  {ann_ret*100:.2f}%")
+        print(f"Expected Ann. Vol:     {ann_vol*100:.2f}%")
+        print(f"Expected Sharpe:       {sharpe:.4f}")
+
+    allocation = pd.DataFrame(rows)
+    return allocation
+
+
+# ─────────────────────────────────────────────
 # Strategy 1 — MPT Sliding Window Backtest
-# Days 1-5 → optimize weights → apply on day 6
-# Slides forward one day at a time
-
+# ─────────────────────────────────────────────
 
 def run_mpt_backtest(prices):
     returns   = compute_returns(prices)
@@ -204,15 +286,12 @@ def run_mpt_backtest(prices):
     return port_df, rebalance_records
 
 
-
-# Strategy 2 — Moving Average Crossover (Golden Cross)
-# 5-day MA > 20-day MA  → invested in SPY
-# 5-day MA < 20-day MA  → hold cash (no return)
-
+# ─────────────────────────────────────────────
+# Strategy 2 — Moving Average Crossover
+# ─────────────────────────────────────────────
 
 def run_ma_strategy(spy_series):
     print("Running Moving Average Crossover strategy...")
-
     df = pd.DataFrame({"price": spy_series})
     df["ma_short"] = df["price"].rolling(MA_SHORT).mean()
     df["ma_long"]  = df["price"].rolling(MA_LONG).mean()
@@ -220,24 +299,71 @@ def run_ma_strategy(spy_series):
 
     val    = INITIAL_CAPITAL
     values = []
-
     for i in range(1, len(df)):
         today     = df.index[i]
         ret       = df["price"].iloc[i] / df["price"].iloc[i - 1] - 1
         in_market = df["ma_short"].iloc[i - 1] > df["ma_long"].iloc[i - 1]
-
         if in_market:
             val *= (1 + ret)
-
         values.append((today, val))
 
     ma_df = pd.DataFrame(values, columns=["Date", "Value"]).set_index("Date")
     return ma_df
 
 
+# ─────────────────────────────────────────────
+# Strategy 3 — VIX Fear Gated MPT
+# ─────────────────────────────────────────────
 
+def run_vix_strategy(prices, vix_series):
+    print("Running VIX Fear Index gated MPT strategy...")
+    returns   = compute_returns(prices)
+    all_dates = returns.index
+
+    portfolio_val    = INITIAL_CAPITAL
+    portfolio_values = []
+    days_in_cash     = 0
+    days_invested    = 0
+
+    for i in range(WINDOW, len(all_dates)):
+        window_ret = returns.iloc[i - WINDOW: i]
+        today_date = all_dates[i]
+        today_ret  = returns.iloc[i]
+
+        prev_date    = all_dates[i - 1]
+        vix_yesterday = vix_series.loc[prev_date] if prev_date in vix_series.index else 20.0
+
+        if vix_yesterday > VIX_THRESHOLD:
+            days_in_cash += 1
+            portfolio_values.append((today_date, portfolio_val))
+            continue
+
+        selected = select_top_stocks(window_ret)
+        if len(selected) < 2:
+            portfolio_values.append((today_date, portfolio_val))
+            continue
+
+        weights, _, _, _ = optimize_portfolio(window_ret[selected])
+        if weights is None:
+            weights = np.full(len(selected), 1.0 / len(selected))
+
+        daily_return  = np.dot(weights, today_ret[selected].values)
+        portfolio_val *= (1 + daily_return)
+        days_invested += 1
+        portfolio_values.append((today_date, portfolio_val))
+
+    total_days = days_in_cash + days_invested
+    pct_cash   = days_in_cash / total_days * 100 if total_days > 0 else 0
+    print(f"  VIX strategy: {days_invested} days invested, "
+          f"{days_in_cash} days in cash ({pct_cash:.1f}% cash rate)")
+
+    vix_df = pd.DataFrame(portfolio_values, columns=["Date", "Value"]).set_index("Date")
+    return vix_df
+
+
+# ─────────────────────────────────────────────
 # S&P 500 Buy-and-Hold Baseline
-
+# ─────────────────────────────────────────────
 
 def build_spy_baseline(spy_series, port_index):
     spy_ret = spy_series.pct_change().dropna()
@@ -263,25 +389,30 @@ def build_spy_baseline(spy_series, port_index):
     return spy_df
 
 
+# ─────────────────────────────────────────────
+# Align all strategies to common dates
+# ─────────────────────────────────────────────
 
-# Align all three strategies to common dates
+def align_strategies(port_df, spy_df, ma_df, vix_df):
+    common = (port_df.index
+              .intersection(spy_df.index)
+              .intersection(ma_df.index)
+              .intersection(vix_df.index))
 
-
-def align_strategies(port_df, spy_df, ma_df):
-    common = port_df.index.intersection(spy_df.index).intersection(ma_df.index)
     port_df = port_df.loc[common].copy()
     spy_df  = spy_df.loc[common].copy()
     ma_df   = ma_df.loc[common].copy()
+    vix_df  = vix_df.loc[common].copy()
 
-    for df in [spy_df, ma_df]:
+    for df in [spy_df, ma_df, vix_df]:
         df["Value"] = df["Value"] / df["Value"].iloc[0] * INITIAL_CAPITAL
 
-    return port_df, spy_df, ma_df
+    return port_df, spy_df, ma_df, vix_df
 
 
-
+# ─────────────────────────────────────────────
 # Compute Summary Metrics
-
+# ─────────────────────────────────────────────
 
 def compute_metrics(series, label):
     daily        = series.pct_change().dropna()
@@ -289,17 +420,17 @@ def compute_metrics(series, label):
     sharpe       = (daily.mean() - RISK_FREE_RATE) / daily.std() * np.sqrt(252)
     max_drawdown = ((series / series.cummax()) - 1).min() * 100
     return {
-        "Strategy":            label,
-        "Final Value ($)":     round(series.iloc[-1], 2),
-        "Total Return (%)":    round(total_return, 2),
-        "Annualized Sharpe":   round(sharpe, 4),
-        "Max Drawdown (%)":    round(max_drawdown, 2)
+        "Strategy":           label,
+        "Final Value ($)":    round(series.iloc[-1], 2),
+        "Total Return (%)":   round(total_return, 2),
+        "Annualized Sharpe":  round(sharpe, 4),
+        "Max Drawdown (%)":   round(max_drawdown, 2)
     }
 
 
-
+# ─────────────────────────────────────────────
 # Plot 1 — Efficient Frontier
-
+# ─────────────────────────────────────────────
 
 def plot_efficient_frontier(returns, selected_stocks, optimal_weights):
     print("Plotting efficient frontier...")
@@ -323,7 +454,7 @@ def plot_efficient_frontier(returns, selected_stocks, optimal_weights):
     plt.colorbar(sc, ax=ax, label="Sharpe Ratio")
     ax.set_xlabel("Annualized Volatility", fontsize=12)
     ax.set_ylabel("Annualized Return",     fontsize=12)
-    ax.set_title("Efficient Frontier — Random Portfolios vs Optimal Point", fontsize=13)
+    ax.set_title(f"Efficient Frontier — {START_DATE} to {END_DATE}", fontsize=13)
     ax.legend(fontsize=10)
     plt.tight_layout()
     path = OUTPUT_DIR + "efficient_frontier.png"
@@ -332,11 +463,11 @@ def plot_efficient_frontier(returns, selected_stocks, optimal_weights):
     print(f"  Saved: {path}")
 
 
+# ─────────────────────────────────────────────
+# Plot 2 — Portfolio Value: All 4 Strategies
+# ─────────────────────────────────────────────
 
-# Plot 2 — Portfolio Value: All 3 Strategies
-
-
-def plot_performance(port_df, spy_df, ma_df):
+def plot_performance(port_df, spy_df, ma_df, vix_df):
     print("Plotting performance comparison...")
     fig, ax = plt.subplots(figsize=(13, 5))
     ax.plot(port_df.index, port_df["Value"], label="MPT Portfolio",
@@ -345,10 +476,13 @@ def plot_performance(port_df, spy_df, ma_df):
             color="darkorange", linewidth=2, linestyle="--")
     ax.plot(ma_df.index,   ma_df["Value"],   label="MA Crossover (5/20)",
             color="green",      linewidth=2, linestyle="-.")
+    ax.plot(vix_df.index,  vix_df["Value"],  label="VIX Fear Gated MPT",
+            color="crimson",    linewidth=2, linestyle=":")
     ax.set_xlabel("Date",                fontsize=11)
     ax.set_ylabel("Portfolio Value ($)", fontsize=11)
-    ax.set_title("Strategy Comparison — $10,000 Starting Capital (2023)", fontsize=13)
-    ax.legend(fontsize=11)
+    ax.set_title(f"Strategy Comparison — $10,000 Starting Capital "
+                 f"({START_DATE} to {END_DATE})", fontsize=12)
+    ax.legend(fontsize=10)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     fig.autofmt_xdate()
     plt.tight_layout()
@@ -358,9 +492,9 @@ def plot_performance(port_df, spy_df, ma_df):
     print(f"  Saved: {path}")
 
 
-
+# ─────────────────────────────────────────────
 # Plot 3 — Daily Allocation Shift
-
+# ─────────────────────────────────────────────
 
 def plot_allocation_shift(rebalance_records):
     print("Plotting allocation shift...")
@@ -391,11 +525,11 @@ def plot_allocation_shift(rebalance_records):
     print(f"  Saved: {path}")
 
 
-
+# ─────────────────────────────────────────────
 # Plot 4 — Rolling 21-Day Sharpe Ratio
+# ─────────────────────────────────────────────
 
-
-def plot_rolling_sharpe(port_df, spy_df, ma_df):
+def plot_rolling_sharpe(port_df, spy_df, ma_df, vix_df):
     print("Plotting rolling Sharpe...")
     roll = 21
 
@@ -404,22 +538,24 @@ def plot_rolling_sharpe(port_df, spy_df, ma_df):
         return (daily.rolling(roll).mean() - RISK_FREE_RATE) / \
                 daily.rolling(roll).std() * np.sqrt(252)
 
-    rs_mpt = rolling_sharpe(port_df["Value"])
-    rs_spy = rolling_sharpe(spy_df["Value"])
-    rs_ma  = rolling_sharpe(ma_df["Value"])
-
     fig, ax = plt.subplots(figsize=(13, 5))
-    ax.plot(rs_mpt.index, rs_mpt, label="MPT Portfolio",
-            color="steelblue",  linewidth=1.5)
-    ax.plot(rs_spy.index, rs_spy, label="S&P 500 (Buy & Hold)",
-            color="darkorange", linewidth=1.5, linestyle="--")
-    ax.plot(rs_ma.index,  rs_ma,  label="MA Crossover (5/20)",
-            color="green",      linewidth=1.5, linestyle="-.")
+    ax.plot(rolling_sharpe(port_df["Value"]).index,
+            rolling_sharpe(port_df["Value"]),
+            label="MPT Portfolio",        color="steelblue",  linewidth=1.5)
+    ax.plot(rolling_sharpe(spy_df["Value"]).index,
+            rolling_sharpe(spy_df["Value"]),
+            label="S&P 500 (Buy & Hold)", color="darkorange", linewidth=1.5, linestyle="--")
+    ax.plot(rolling_sharpe(ma_df["Value"]).index,
+            rolling_sharpe(ma_df["Value"]),
+            label="MA Crossover (5/20)",  color="green",      linewidth=1.5, linestyle="-.")
+    ax.plot(rolling_sharpe(vix_df["Value"]).index,
+            rolling_sharpe(vix_df["Value"]),
+            label="VIX Fear Gated MPT",   color="crimson",    linewidth=1.5, linestyle=":")
     ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
     ax.set_xlabel("Date",                       fontsize=11)
     ax.set_ylabel(f"Rolling {roll}-Day Sharpe", fontsize=11)
     ax.set_title(f"Rolling {roll}-Day Sharpe Ratio — All Strategies", fontsize=13)
-    ax.legend(fontsize=11)
+    ax.legend(fontsize=10)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
     fig.autofmt_xdate()
     plt.tight_layout()
@@ -429,57 +565,90 @@ def plot_rolling_sharpe(port_df, spy_df, ma_df):
     print(f"  Saved: {path}")
 
 
+# ─────────────────────────────────────────────
+# Plot 5 — VIX Fear Index
+# ─────────────────────────────────────────────
 
+def plot_vix(vix_series):
+    print("Plotting VIX fear index...")
+    fig, ax = plt.subplots(figsize=(13, 4))
+    ax.plot(vix_series.index, vix_series.values,
+            color="crimson", linewidth=1.5, label="VIX")
+    ax.axhline(VIX_THRESHOLD, color="black", linewidth=1,
+               linestyle="--", label=f"Fear Threshold ({VIX_THRESHOLD})")
+    ax.fill_between(vix_series.index, VIX_THRESHOLD, vix_series.values,
+                    where=(vix_series.values > VIX_THRESHOLD),
+                    alpha=0.2, color="crimson", label="Extreme Fear (Cash)")
+    ax.fill_between(vix_series.index, 0, vix_series.values,
+                    where=(vix_series.values <= VIX_THRESHOLD),
+                    alpha=0.1, color="green", label="Normal (Invested)")
+    ax.set_xlabel("Date",      fontsize=11)
+    ax.set_ylabel("VIX Level", fontsize=11)
+    ax.set_title("VIX Fear Index — Red Zones = Portfolio Holds Cash", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    path = OUTPUT_DIR + "vix_fear_index.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Saved: {path}")
+
+
+# ─────────────────────────────────────────────
 # Print + Save Summary
+# ─────────────────────────────────────────────
 
-
-def print_and_save_summary(port_df, spy_df, ma_df, rebalance_records, elapsed):
+def print_and_save_summary(port_df, spy_df, ma_df, vix_df, rebalance_records, elapsed):
     metrics = [
         compute_metrics(port_df["Value"], "MPT Portfolio"),
         compute_metrics(spy_df["Value"],  "S&P 500 Buy & Hold"),
         compute_metrics(ma_df["Value"],   "MA Crossover (5/20)"),
+        compute_metrics(vix_df["Value"],  "VIX Fear Gated MPT"),
     ]
 
-    print("\n" + "=" * 66)
+    print("\n" + "=" * 74)
     print("PERFORMANCE SUMMARY")
-    print("=" * 66)
-    print(f"{'Metric':<28} {'MPT':>12} {'S&P 500':>12} {'MA Cross':>10}")
-    print("-" * 66)
+    print("=" * 74)
+    print(f"{'Metric':<26} {'MPT':>11} {'S&P 500':>11} {'MA Cross':>11} {'VIX MPT':>11}")
+    print("-" * 74)
     for key in ["Final Value ($)", "Total Return (%)", "Annualized Sharpe", "Max Drawdown (%)"]:
         vals = [str(m[key]) for m in metrics]
-        print(f"{key:<28} {vals[0]:>12} {vals[1]:>12} {vals[2]:>10}")
-    print("=" * 66)
+        print(f"{key:<26} {vals[0]:>11} {vals[1]:>11} {vals[2]:>11} {vals[3]:>11}")
+    print("=" * 74)
     print(f"\nTotal runtime: {elapsed:.1f} seconds")
-
-    if rebalance_records:
-        last = rebalance_records[-1]
-        print(f"\nLast Rebalance Date: {last['date'].date()}")
-        print(f"{'Ticker':<8} {'Sector':<14} {'Weight':>8}")
-        print("-" * 32)
-        for ticker, w in sorted(last["weights"].items(), key=lambda x: -x[1]):
-            print(f"{ticker:<8} {SECTOR_MAP.get(ticker, 'N/A'):<14} {w*100:>7.1f}%")
 
     summary_df = pd.DataFrame(metrics)
     path = OUTPUT_DIR + "summary.csv"
     summary_df.to_csv(path, index=False)
-    print(f"\nSaved: {path}")
+    print(f"Saved: {path}")
 
 
-
+# ─────────────────────────────────────────────
 # Main
+# ─────────────────────────────────────────────
 
 def main():
     import os
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Data 
+    # --- Data ---
     prices = download_prices()
     spy    = download_spy()
+    vix    = download_vix()
 
-    # Initial selection + frontier 
+    # --- Today's live allocation (production signal) ---
+    print("\n" + "=" * 50)
+    print("TODAY'S RECOMMENDED ALLOCATION")
+    print("=" * 50)
+    todays_allocation = compute_todays_allocation(prices, vix)
+    todays_allocation.to_csv(OUTPUT_DIR + "todays_allocation.csv", index=False)
+    print(f"Saved: {OUTPUT_DIR}todays_allocation.csv")
+
+    # --- Full period backtest ---
     returns          = compute_returns(prices)
     selected_initial = select_top_stocks(returns)
-    print(f"\nInitial stock selection: {selected_initial}")
+    print(f"\nInitial stock selection (full period): {selected_initial}")
 
     opt_w, _, _, opt_s = optimize_portfolio(returns[selected_initial])
     if opt_w is None:
@@ -489,26 +658,28 @@ def main():
 
     plot_efficient_frontier(returns, selected_initial, opt_w)
 
-    # Run all three strategies 
+    # --- Run all strategies ---
     port_df, rebalance_records = run_mpt_backtest(prices)
     spy_df                     = build_spy_baseline(spy, port_df.index)
     ma_df                      = run_ma_strategy(spy)
+    vix_df                     = run_vix_strategy(prices, vix)
 
-    # Align to common dates 
-    port_df, spy_df, ma_df = align_strategies(port_df, spy_df, ma_df)
+    # --- Align to common dates ---
+    port_df, spy_df, ma_df, vix_df = align_strategies(port_df, spy_df, ma_df, vix_df)
 
-    # Generate all 4 plots 
-    plot_performance(port_df, spy_df, ma_df)
+    # --- Generate all 5 plots ---
+    plot_performance(port_df, spy_df, ma_df, vix_df)
     plot_allocation_shift(rebalance_records)
-    plot_rolling_sharpe(port_df, spy_df, ma_df)
+    plot_rolling_sharpe(port_df, spy_df, ma_df, vix_df)
+    plot_vix(vix)
 
-    # Save portfolio values 
+    # --- Save portfolio values ---
     port_df.to_csv(OUTPUT_DIR + "portfolio_values.csv")
     print(f"Saved: {OUTPUT_DIR}portfolio_values.csv")
 
-    # Final summary 
+    # --- Final summary ---
     elapsed = time.time() - START_TIME
-    print_and_save_summary(port_df, spy_df, ma_df, rebalance_records, elapsed)
+    print_and_save_summary(port_df, spy_df, ma_df, vix_df, rebalance_records, elapsed)
 
 
 if __name__ == "__main__":
