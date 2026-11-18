@@ -1,5 +1,5 @@
 Strategy,Final Value ($),Total Return (%),Annualized Sharpe,Max Drawdown (%)
-MPT Portfolio,10901.11,9.01,0.3599,-7.68
-S&P 500 Buy & Hold,11017.32,10.17,0.472,-8.88
-MA Crossover (5/20),10012.32,0.12,-0.5798,-7.47
-CNN Fear Gated MPT,10133.16,1.33,-0.249,-7.64
+MPT Portfolio,11136.48,11.36,0.6408,-7.04
+S&P 500 Buy & Hold,11139.9,11.4,0.5632,-8.88
+MA Crossover (5/20),10123.72,1.24,-0.4293,-7.47
+CNN Fear Gated MPT,10523.88,5.24,0.1114,-7.0
